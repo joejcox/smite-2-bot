@@ -1,0 +1,27 @@
+app = "smite-2-bot"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "node index.js"
+
+[http_service]
+  internal_port = 8080
+  auto_stop_machines = false
+  force_https = true
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [[http_service.checks]]
+    path = "/"
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
