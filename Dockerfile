@@ -9,4 +9,8 @@ RUN npm ci --omit=dev
 COPY . .
 
 ENV NODE_ENV=production
+
+RUN mkdir -p /app/data && chown -R node:node /app
+USER node
+
 CMD ["node", "index.js"]

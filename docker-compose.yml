@@ -1,18 +1,16 @@
-# /opt/smite-bot/compose.yaml
 services:
   smite-bot:
-    build: .                # builds from your Dockerfile
-    image: smite-bot:latest # tag for convenience if you ever push/pull
+    build: .
+    image: smite-bot:latest
     restart: unless-stopped
     env_file: .env
     environment:
       - NODE_ENV=production
       - TZ=Europe/London
-    # run as non-root user provided by node:alpine (optional but recommended)
     user: "node"
     working_dir: /app
     volumes:
-      - ./data:/app/data
+      - smite-bot-data:/app/data
     logging:
       driver: json-file
       options:
@@ -23,3 +21,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+
+volumes:
+  smite-bot-data:
