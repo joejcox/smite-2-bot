@@ -1,6 +1,5 @@
 services:
   smite-bot:
-    build: .
     image: ghcr.io/joejcox/smite-2-bot:v0.5.0
     restart: unless-stopped
     env_file: .env
@@ -21,6 +20,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+    pull_policy: always
 
 volumes:
   smite-bot-data:
