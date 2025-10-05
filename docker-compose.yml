@@ -1,7 +1,7 @@
 services:
   smite-bot:
     build: .
-    image: smite-bot:latest
+    image: ghcr.io/joejcox/smite-2-bot:v0.5.0
     restart: unless-stopped
     env_file: .env
     environment:
