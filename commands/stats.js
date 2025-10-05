@@ -1,6 +1,14 @@
 // commands/stats.js
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import path from 'node:path';
 
+
+// Lazy guard so we only load once
+let diskLoaded = false;
+
+const PERSIST_DIR = path.join(process.cwd(), 'data');
+const PERSIST_FILE = path.join(PERSIST_DIR, 'tier_cache.json');
 
 const TIER_URL = 'https://smitebrain.com/tier-list';
 const GOD_BASE = 'https://smitebrain.com/gods';
@@ -26,6 +34,13 @@ function cachePrune(map) {
     }
 }
 
+async function fetchWithTimeout(url, opts = {}, ms = 2500) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms);
+    try { return await fetch(url, { ...opts, signal: ac.signal }); }
+    finally { clearTimeout(t); }
+}
+
 async function fetchTierItems(role = 'all') {
     cachePrune(dataCache);
 
@@ -38,7 +53,7 @@ async function fetchTierItems(role = 'all') {
 
     const url = role === 'all' ? TIER_URL : `${TIER_URL}?role=${encodeURIComponent(role)}`;
     const p = (async () => {
-        const res = await fetch(url, { headers: { 'user-agent': 'smite2-bot/1.0' } });
+        const res = await fetchWithTimeout(url, { headers: { 'user-agent': 'smite2-bot/1.0' } }, 2500);
         if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
         const html = await res.text();
 
@@ -75,6 +90,70 @@ async function fetchTierItems(role = 'all') {
 // ----- tiny cache for god names per role -----
 const nameCache = new Map(); // role -> { names: string[], expires: number }
 const TTL_MS = 15 * 60 * 1000;
+
+
+async function loadDiskCache() {
+    if (diskLoaded) return;
+    try {
+        const raw = await readFile(PERSIST_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed?.roles && typeof parsed.roles === 'object') {
+            const now = Date.now();
+            for (const r of ROLES) {
+                const names = Array.isArray(parsed.roles[r]) ? parsed.roles[r] : [];
+                if (names.length) {
+                    nameCache.set(r, { names, expires: now + TTL_MS }); // set a TTL so memory stays fresh
+                }
+            }
+        }
+    } catch (_) {
+        // no file yet, ignore
+    } finally {
+        diskLoaded = true;
+    }
+}
+
+async function saveDiskCache() {
+    await mkdir(PERSIST_DIR, { recursive: true });
+    const out = {
+        updatedAt: Date.now(),
+        roles: {},
+    };
+    for (const r of ROLES) {
+        const entry = nameCache.get(r);
+        out.roles[r] = entry?.names ?? [];
+    }
+    await writeFile(PERSIST_FILE, JSON.stringify(out, null, 2));
+}
+
+// Warm a single role (fetch, fill in-memory caches, persist afterward)
+async function warmRole(role = 'all') {
+    const items = await fetchTierItems(role);
+    const names = [...new Set(items.map(it => it.god).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    nameCache.set(role, { names, expires: Date.now() + TTL_MS });
+}
+
+// Called once on startup
+export async function prewarmCache() {
+    await loadDiskCache(); // seed from disk immediately
+    // Warm in parallel to avoid long boot
+    await Promise.all(ROLES.map(r => warmRole(r).catch(() => { })));
+    await saveDiskCache();
+}
+
+// Schedule a periodic refresh (default weekly)
+export function scheduleCacheRefresh(intervalMs = 7 * 24 * 60 * 60 * 1000) {
+    setInterval(async () => {
+        try {
+            for (const r of ROLES) await warmRole(r);
+            await saveDiskCache();
+            // prune icon cache too (nice-to-have)
+            cachePrune(iconCache);
+        } catch (e) {
+            console.warn('weekly cache refresh failed:', e?.message || e);
+        }
+    }, intervalMs).unref?.();
+}
 
 function slugify(name) {
     return String(name).toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
@@ -173,33 +252,48 @@ export const data = new SlashCommandBuilder()
 
 // 🔎 autocomplete handler
 export async function autocomplete(interaction) {
-    const focused = interaction.options.getFocused(true); // { name: 'god' | 'role', value: '...' }
-    if (focused.name !== 'god') return;
+    try {
+        const focused = interaction.options.getFocused(true); // { name: 'god' | 'role', value: '...' }
+        if (focused.name !== 'god') return;
 
-    // consider current role selection to narrow suggestions
-    const role = (interaction.options.getString('role') ?? 'all').toLowerCase();
-    const names = await getGodNames(ROLES.includes(role) ? role : 'all');
+        // consider current role selection to narrow suggestions
+        const role = (interaction.options.getString('role') ?? 'all').toLowerCase();
+        const entry = nameCache.get(ROLES.includes(role) ? role : 'all');
+        const names = entry?.names ?? [];
 
-    const q = String(focused.value || '').toLowerCase();
-    const starts = [];
-    const contains = [];
+        const q = String(focused.value || '').toLowerCase();
 
-    for (const n of names) {
-        const ln = n.toLowerCase();
-        if (!q || ln.startsWith(q)) starts.push(n);
-        else if (ln.includes(q)) contains.push(n);
-        if (starts.length >= 25) break;
+        const starts = [];
+        const contains = [];
+        for (const n of names) {
+            const ln = n.toLowerCase();
+            if (!q || ln.startsWith(q)) starts.push(n);
+            else if (ln.includes(q)) contains.push(n);
+            if (starts.length >= 25) break;
+        }
+
+        const suggestions = (starts.length < 25 ? starts.concat(contains) : starts).slice(0, 25);
+
+        // Single attempt to respond; then return
+        await interaction.respond(suggestions.map(n => ({ name: n, value: n })));
+
+        // Warm in background if cache is stale (don’t await)
+        if (!entry || entry.expires <= Date.now()) {
+            warmRole(ROLES.includes(role) ? role : 'all').then(saveDiskCache).catch(() => { });
+        }
+    } catch (e) {
+        // Swallow “already acknowledged” & “unknown interaction” so logs stay clean
+        if (e?.code !== 40060 && e?.code !== 10062) {
+            console.warn('autocomplete respond err:', e);
+        }
     }
-
-    const suggestions = (starts.length < 25 ? starts.concat(contains) : starts).slice(0, 25);
-    await interaction.respond(suggestions.map(n => ({ name: n, value: n })));
 }
 
 // 🧾 main execute (unchanged from your working role-aware stats)
 export async function execute(interaction) {
+    await interaction.deferReply();
     const query = interaction.options.getString('god', true);
     const role = (interaction.options.getString('role') ?? 'all').toLowerCase();
-    await interaction.deferReply();
 
     try {
         const url = role === 'all' ? TIER_URL : `${TIER_URL}?role=${encodeURIComponent(role)}`;
